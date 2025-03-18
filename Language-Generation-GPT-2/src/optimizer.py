@@ -14,6 +14,7 @@ from torch.nn import CrossEntropyLoss, MSELoss
 import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
+from torch.optim import Adam
 
 
 def add_optimizer_params(parser: argparse.ArgumentParser):
@@ -317,14 +318,24 @@ def create_adam_optimizer_from_args(model, args, grouped_parameters=None):
     if grouped_parameters is None:
         grouped_parameters = create_grouped_parameters(model, args.no_decay_bias)
 
-    optimizer = AdamW(
+    # optimizer = AdamW(
+    #     grouped_parameters, 
+    #     lr=args.lr, 
+    #     betas=(args.adam_beta1, args.adam_beta2), 
+    #     eps=args.adam_epislon, 
+    #     weight_decay=args.weight_decay, 
+    #     correct_bias=args.correct_bias
+    # )
+    
+    optimizer = Adam(
         grouped_parameters, 
         lr=args.lr, 
         betas=(args.adam_beta1, args.adam_beta2), 
-        eps=args.adam_epislon, 
-        weight_decay=args.weight_decay, 
-        correct_bias=args.correct_bias
+        eps=args.adam_epislon
     )
+    
+    
+    
     return optimizer
 
 

@@ -6,4 +6,4 @@ tqdm
 tensorboard
 progress
 loralib
-git+git://github.com/pytorch/opacus.git@7079be
+git+https://github.com/pytorch/opacus.git@7079be
