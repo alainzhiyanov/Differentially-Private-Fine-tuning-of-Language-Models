@@ -7,7 +7,7 @@ import math
 import os
 from collections import OrderedDict 
 import argparse
-
+from dp_optimizers import AdamCorr
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
@@ -327,12 +327,22 @@ def create_adam_optimizer_from_args(model, args, grouped_parameters=None):
     #     correct_bias=args.correct_bias
     # )
     
-    optimizer = Adam(
-        grouped_parameters, 
-        lr=args.lr, 
-        betas=(args.adam_beta1, args.adam_beta2), 
-        eps=args.adam_epislon
-    )
+    # optimizer = Adam(
+    #     grouped_parameters, 
+    #     lr=args.lr, 
+    #     betas=(args.adam_beta1, args.adam_beta2), 
+    #     eps=args.adam_epislon
+    # )
+    
+    optimizer = AdamCorr(
+            grouped_parameters, lr=args.lr,
+            dp_batch_size=args.train_batch_size,
+            dp_noise_multiplier=args.noise_multiplier,
+            dp_l2_norm_clip=args.clip,
+            eps_root=args.adam_epislon,
+            betas=(0.9, 0.999),
+        )
+
     
     
     

@@ -395,14 +395,29 @@ if __name__ == '__main__':
     ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
     # We instead use the accountant from Gopi et al. (2021) as described in the paper.
     SAMPLE_RATE = (args.train_batch_size * args.grad_acc)/42061.0
+    
     privacy_engine = PrivacyEngine(
         module=lm_net,
-        sample_rate=SAMPLE_RATE,
+        sample_rate=SAMPLE_RATE, 
         alphas=ALPHAS,
         noise_multiplier=args.noise_multiplier,
         max_grad_norm=max_grad_norm,
     )
     privacy_engine.attach(optimizer)
+    
+    # privacy_engine = PrivacyEngine(accountant='prv')
+    # model, optimizer, train_loader_for_accountant = privacy_engine.make_private_with_epsilon(
+    #     module=lm_net,
+    #     optimizer=optimizer,
+    #     data_loader=train_loader,
+    #     epochs=args.max_epoch,
+    #     target_epsilon=args.noise_multiplier,
+    #     target_delta=1e-5,
+    #     max_grad_norm=args.max_grad_norm,
+    #     poisson_sampling=False,
+    #     # grad_sample_mode="ghost",
+    # )
+    
     delta = 1.0/42061 # We instead use the accountant from Gopi et al. (2021) as described in the paper.
 
     try:
