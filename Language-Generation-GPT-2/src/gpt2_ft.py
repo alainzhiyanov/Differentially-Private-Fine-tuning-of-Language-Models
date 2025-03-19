@@ -398,7 +398,7 @@ if __name__ == '__main__':
     n_layers = len([(n, p) for n, p in lm_net.named_parameters() if p.requires_grad])
     # max_grad_norm = [args.max_grad_norm / np.sqrt(n_layers)] * n_layers
 
-    ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
+    # ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
     # We instead use the accountant from Gopi et al. (2021) as described in the paper.
     SAMPLE_RATE = (args.train_batch_size * args.grad_acc)/42061.0
     
