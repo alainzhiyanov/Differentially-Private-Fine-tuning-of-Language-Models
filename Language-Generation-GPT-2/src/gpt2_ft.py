@@ -16,7 +16,9 @@ from torch.utils.data import DataLoader
 torch.set_printoptions(threshold=100000)
 from opacus import PrivacyEngine
 from opacus.grad_sample import utils as opacus_utils
-from opacus.layers import DifferentiallyPrivateDistributedDataParallel as DPDDP
+# from opacus.layers import DifferentiallyPrivateDistributedDataParallel as DPDDP
+# from opacus.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
+
 
 from gpu import (
     add_gpu_params, 
@@ -99,6 +101,8 @@ parser.add_argument('--roll_step', type=int, default=100, help='rolling step')
 
 parser.add_argument('--eval_epoch', type=int, default=1, help='eval per number of epochs')
 
+parser.add_argument('--eps_root', type=float, default=0.00001, help='stability constant in DP-AdamBC')
+
 # influence model, calculate the influence score between two samples.
 def print_args(args):
     if args.rank == 0:
@@ -128,7 +132,9 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def optimizer_step(_loss, _optimizer, _model, _schedule, args, is_update=True):
+def optimizer_step(_loss, _optimizer, _model,
+                   # _schedule,
+                   args, is_update=True):
     if args.fp16:
         with amp.scale_loss(_loss, _optimizer) as _scaled_loss:
             _scaled_loss.backward()
@@ -148,8 +154,8 @@ def optimizer_step(_loss, _optimizer, _model, _schedule, args, is_update=True):
         # This should fail if we are using any gradient accumulation with Opacus DDP
         _optimizer.virtual_step()
 
-    if _schedule is not None:
-        _schedule.step()
+    # if _schedule is not None:
+    #     _schedule.step()
 
 
 def evaluate(model, valid_loader, args):
@@ -183,7 +189,7 @@ def evaluate(model, valid_loader, args):
 def train_validate(
     model, 
     optimizer, 
-    scheduler, 
+    # scheduler,
     train_loader, 
     valid_loader, 
     args, 
@@ -196,7 +202,7 @@ def train_validate(
     log_start_time = time.time()
     best_val_ppl = None
 
-    train_loader.sampler.set_epoch(epoch)
+    # train_loader.sampler.set_epoch(epoch)
 
     for idx, data in enumerate(train_loader):
         data = {key: value for key, value in data.items()}
@@ -218,7 +224,7 @@ def train_validate(
         #     _lm_loss/(args.grad_acc), optimizer, model, scheduler, args, is_update=is_update
         # )
         optimizer_step(
-            _lm_loss, optimizer, model, scheduler, args, is_update=is_update
+            _lm_loss, optimizer, model, args, is_update=is_update
         )
 
         if train_step % args.log_interval == 0: 
@@ -303,7 +309,7 @@ def compute_transformers_MergedLinear_grad_sample(layer: MergedLinear, A: torch.
 
 if __name__ == '__main__':
     args = parser.parse_args()
-    parse_gpu(args)
+    # parse_gpu(args)
     print_args(args)
 
     if args.fp16:
@@ -330,13 +336,13 @@ if __name__ == '__main__':
     train_loader = DataLoader(
         train_data, batch_size=args.train_batch_size, num_workers=0, 
         shuffle=False, pin_memory=False, drop_last=True,
-        sampler=torch.utils.data.distributed.DistributedSampler(train_data, seed=args.random_seed)
+        # sampler=torch.utils.data.distributed.DistributedSampler(train_data, seed=args.random_seed)
     )
     
     valid_loader = DataLoader(
         valid_data, batch_size=args.valid_batch_size, num_workers=0, 
         shuffle=False, pin_memory=False, drop_last=False,
-        sampler=torch.utils.data.distributed.DistributedSampler(valid_data, seed=args.random_seed)
+        # sampler=torch.utils.data.distributed.DistributedSampler(valid_data, seed=args.random_seed)
     )
 
     if args.model_card == 'gpt2.sm':
@@ -377,61 +383,65 @@ if __name__ == '__main__':
 
     if args.lora_dim > 0:
         lora.mark_only_lora_as_trainable(lm_net)
-    opacus_utils.register_grad_sampler(MergedLinear)(compute_transformers_MergedLinear_grad_sample)
-    lm_net = DPDDP(lm_net)
+    # opacus_utils.register_grad_sampler(MergedLinear)(compute_transformers_MergedLinear_grad_sample)  # fixme
+    # lm_net = DPDDP(lm_net)
     optimizer = create_adam_optimizer_from_args(lm_net, args)
 
     if args.max_step is None:
         args.max_step = (args.max_epoch * train_data.num_batches + args.world_size - 1) // args.world_size
         print('set max_step:', args.max_step)
 
-    scheduler = create_optimizer_scheduler(optimizer, args)
+    # scheduler = create_optimizer_scheduler(optimizer, args)
     if args.fp16:
         lm_net, optimizer = amp.initialize(lm_net, optimizer, opt_level="O1")
 
     n_layers = len([(n, p) for n, p in lm_net.named_parameters() if p.requires_grad])
-    max_grad_norm = [args.max_grad_norm / np.sqrt(n_layers)] * n_layers
+    # max_grad_norm = [args.max_grad_norm / np.sqrt(n_layers)] * n_layers
 
     ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
     # We instead use the accountant from Gopi et al. (2021) as described in the paper.
     SAMPLE_RATE = (args.train_batch_size * args.grad_acc)/42061.0
     
-    privacy_engine = PrivacyEngine(
-        module=lm_net,
-        sample_rate=SAMPLE_RATE, 
-        alphas=ALPHAS,
-        noise_multiplier=args.noise_multiplier,
-        max_grad_norm=max_grad_norm,
-    )
-    privacy_engine.attach(optimizer)
-    
-    # privacy_engine = PrivacyEngine(accountant='prv')
-    # model, optimizer, train_loader_for_accountant = privacy_engine.make_private_with_epsilon(
+    # privacy_engine = PrivacyEngine(
     #     module=lm_net,
-    #     optimizer=optimizer,
-    #     data_loader=train_loader,
-    #     epochs=args.max_epoch,
-    #     target_epsilon=args.noise_multiplier,
-    #     target_delta=1e-5,
-    #     max_grad_norm=args.max_grad_norm,
-    #     poisson_sampling=False,
-    #     # grad_sample_mode="ghost",
+    #     sample_rate=SAMPLE_RATE,
+    #     alphas=ALPHAS,
+    #     noise_multiplier=args.noise_multiplier,
+    #     max_grad_norm=max_grad_norm,
     # )
+    # privacy_engine.attach(optimizer)
     
     delta = 1.0/42061 # We instead use the accountant from Gopi et al. (2021) as described in the paper.
+
+    privacy_engine = PrivacyEngine(accountant='prv')
+    lm_net, optimizer, train_loader = privacy_engine.make_private(
+        module=lm_net,
+        optimizer=optimizer,
+        data_loader=train_loader,
+        max_grad_norm=args.max_grad_norm,
+        noise_multiplier=args.noise_multiplier,
+        poisson_sampling=False,
+        # grad_sample_mode="ghost",
+    )
 
     try:
         train_step = 0
         for epoch in itertools.count(start=1):
+            # train_step = train_validate(
+            #     lm_net, optimizer, scheduler, train_loader, valid_loader, args,
+            #     train_step=train_step, epoch=epoch
+            # )
             train_step = train_validate(
-                lm_net, optimizer, scheduler, train_loader, valid_loader, args, 
+                lm_net, optimizer, train_loader, valid_loader, args,
                 train_step=train_step, epoch=epoch
             )
 
             # Printing epsilon from opacus privacy engine at the end of each epoch
-            eps, alpha = optimizer.privacy_engine.get_privacy_spent(delta)
-            print("End of epoch {}, we have epsilon {} for alpha {}".format(epoch, eps, alpha))
-            
+            # eps, alpha = optimizer.privacy_engine.get_privacy_spent(delta)
+            # print("End of epoch {}, we have epsilon {} for alpha {}".format(epoch, eps, alpha))
+            # eps = privacy_engine.get_epsilon(delta)  # fixme: comment out for faster speed
+            # print("End of epoch {}, we have epsilon {}".format(epoch, eps))
+
             if train_step >= args.max_step or (args.max_epoch is not None and epoch >= args.max_epoch):
                 if args.rank == 0:
                     print('-' * 100)
@@ -442,6 +452,6 @@ if __name__ == '__main__':
             print('-' * 100)
             print('Exiting from training early')
 
-    distributed_sync(args)
+    # distributed_sync(args)
     print('cleanup dist ...')
     cleanup(args)
