@@ -16,6 +16,9 @@ from torch.utils.data import DataLoader
 torch.set_printoptions(threshold=100000)
 from opacus import PrivacyEngine
 from opacus.grad_sample import utils as opacus_utils
+from opacus.grad_sample import register_grad_sampler
+from typing import Dict
+
 # from opacus.layers import DifferentiallyPrivateDistributedDataParallel as DPDDP
 # from opacus.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
 
@@ -240,12 +243,12 @@ def train_validate(
             log_start_time = time.time()
             avg_lm_loss.reset()
         
-        if train_step % args.save_interval == 0: 
-            if args.rank == 0:
-                model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
-                print('saving checkpoint', model_path)
-                torch.save({'model_state_dict': lora.lora_state_dict(model)}, model_path)
-            distributed_sync(args)
+        # if train_step % args.save_interval == 0: 
+        #     if args.rank == 0:
+        #         model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
+        #         print('saving checkpoint', model_path)
+        #         torch.save({'model_state_dict': lora.lora_state_dict(model)}, model_path)
+        #     distributed_sync(args)
 
         # evaluation interval
         if train_step % args.eval_interval == 0:
@@ -271,12 +274,12 @@ def train_validate(
         if train_step == args.max_step:
             break
 
-    if args.rank == 0:
-        model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
-        print('saving checkpoint', model_path)
-        torch.save({'model_state_dict': model.state_dict()}, model_path) 
-    distributed_sync(args)
-    return train_step
+    # if args.rank == 0:
+    #     model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
+    #     print('saving checkpoint', model_path)
+    #     torch.save({'model_state_dict': model.state_dict()}, model_path) 
+    # distributed_sync(args)
+    return avg_lm_loss.avg, train_step
 
 
 def reverse_zero_pad(x, W, enable_lora, out_features):
@@ -289,22 +292,49 @@ def reverse_zero_pad(x, W, enable_lora, out_features):
     return result.view((*x.shape[:-1], out_features // len(enable_lora) * sum(enable_lora)))
 
 
-def compute_transformers_MergedLinear_grad_sample(layer: MergedLinear, A: torch.Tensor, B: torch.Tensor, batch_dim: int = 0) -> None:
+@register_grad_sampler(MergedLinear)
+def compute_transformers_MergedLinear_grad_sample(
+    layer: MergedLinear, A: torch.Tensor, B: torch.Tensor
+) -> Dict[torch.nn.Parameter, torch.Tensor]:
+    if isinstance(A, list):
+        A = torch.stack(A, dim=0)
+    if isinstance(B, list):
+        B = torch.stack(B, dim=0)
+
+    if A.ndim > 3:
+        A = A.view(A.shape[0], -1, A.shape[-1])  # [batch, seq_len, in_features]
+    if B.ndim > 3:
+        B = B.view(B.shape[0], -1, B.shape[-1])
+
     delta1 = reverse_zero_pad(B, layer.weight, layer.enable_lora, layer.out_features) * layer.scaling
     after_A = F.linear(layer.lora_dropout(A), layer.lora_A)
+    if after_A.ndim == 4:
+        after_A = after_A.view(after_A.shape[0], -1, after_A.shape[-2], after_A.shape[-1])
+        after_A = after_A.squeeze(2)
+
     t_after_A = after_A.transpose(-2, -1)
     in_channel = t_after_A.shape[1]
     out_channel = delta1.shape[-1]
     lora_b_channel = layer.lora_B.shape[0]
     
+    # Compute grad samples for lora_B
     gs1 = torch.einsum("nik,nkj->nij", t_after_A[:, :in_channel//2, :], delta1[:, :, :out_channel//2])
     gs2 = torch.einsum("nik,nkj->nij", t_after_A[:, in_channel//2:, :], delta1[:, :, out_channel//2:])
-    opacus_utils.create_or_extend_grad_sample(layer.lora_B, torch.cat((gs1, gs2), -1).transpose(-2,-1).contiguous(), batch_dim)
+    grad_lora_B = torch.cat((gs1, gs2), -1).transpose(-2, -1).contiguous()
+
+    # Compute grad samples for lora_A
     gs3 = torch.einsum("nik,kj->nij", delta1[:, :, :out_channel//2], layer.lora_B[:lora_b_channel//2, :])
     gs4 = torch.einsum("nik,kj->nij", delta1[:, :, out_channel//2:], layer.lora_B[lora_b_channel//2:, :])
     after_A_deriv = torch.cat((gs3, gs4), -1)
-    lora_A_deriv = torch.einsum("nki,nkj->nij", after_A_deriv, layer.lora_dropout(A))
-    opacus_utils.create_or_extend_grad_sample(layer.lora_A, lora_A_deriv.contiguous(), batch_dim)
+    grad_lora_A = torch.einsum("nki,nkj->nij", after_A_deriv, layer.lora_dropout(A)).contiguous()
+
+    # Return the dictionary mapping each parameter to its per-sample gradient
+    return {
+        layer.lora_B: grad_lora_B,
+        layer.lora_A: grad_lora_A,
+    }
+
+
 
 
 if __name__ == '__main__':
@@ -383,7 +413,7 @@ if __name__ == '__main__':
 
     if args.lora_dim > 0:
         lora.mark_only_lora_as_trainable(lm_net)
-    # opacus_utils.register_grad_sampler(MergedLinear)(compute_transformers_MergedLinear_grad_sample)  # fixme
+    opacus_utils.register_grad_sampler(MergedLinear)(compute_transformers_MergedLinear_grad_sample)  # fixme
     # lm_net = DPDDP(lm_net)
     optimizer = create_adam_optimizer_from_args(lm_net, args)
 
@@ -398,7 +428,7 @@ if __name__ == '__main__':
     n_layers = len([(n, p) for n, p in lm_net.named_parameters() if p.requires_grad])
     # max_grad_norm = [args.max_grad_norm / np.sqrt(n_layers)] * n_layers
 
-    # ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
+    ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
     # We instead use the accountant from Gopi et al. (2021) as described in the paper.
     SAMPLE_RATE = (args.train_batch_size * args.grad_acc)/42061.0
     
