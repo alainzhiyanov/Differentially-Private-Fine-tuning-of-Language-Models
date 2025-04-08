@@ -17,7 +17,9 @@ torch.set_printoptions(threshold=100000)
 from opacus import PrivacyEngine
 from opacus.grad_sample import utils as opacus_utils
 from opacus.grad_sample import register_grad_sampler
+from collections import defaultdict
 from typing import Dict
+import encoder
 
 # from opacus.layers import DifferentiallyPrivateDistributedDataParallel as DPDDP
 # from opacus.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
@@ -138,18 +140,20 @@ class AverageMeter(object):
 def optimizer_step(_loss, _optimizer, _model,
                    # _schedule,
                    args, is_update=True):
-    if args.fp16:
-        with amp.scale_loss(_loss, _optimizer) as _scaled_loss:
-            _scaled_loss.backward()
-    else:
-        _loss.backward()
+    # if args.fp16:
+    #     with amp.scale_loss(_loss, _optimizer) as _scaled_loss:
+    #         _scaled_loss.backward()
+    # else:
+    #     _loss.backward()
+    _loss.backward()
 
     if is_update:
         if args.clip > 0:
-            if args.fp16:
-                torch.nn.utils.clip_grad_norm_(amp.master_params(_optimizer), args.clip)
-            else:
-                torch.nn.utils.clip_grad_norm_(_model.parameters(), args.clip)
+            # if args.fp16:
+            #     torch.nn.utils.clip_grad_norm_(amp.master_params(_optimizer), args.clip)
+            # else:
+            #     torch.nn.utils.clip_grad_norm_(_model.parameters(), args.clip)
+            torch.nn.utils.clip_grad_norm_(_model.parameters(), args.clip)
 
         _optimizer.step()        
         _optimizer.zero_grad()
@@ -168,6 +172,12 @@ def evaluate(model, valid_loader, args):
 
     avg_lm_loss = AverageMeter()
 
+    criterion = torch.nn.CrossEntropyLoss(reduction='none')
+    token_loss_sum = defaultdict(float)
+    token_loss_count = defaultdict(int)
+    
+    enc = encoder.get_encoder("vocab/") 
+    
     with torch.no_grad():
         for idx, data in enumerate(valid_loader):
             data = {key: value for key, value in data.items()}
@@ -180,9 +190,46 @@ def evaluate(model, valid_loader, args):
             loss = _loss.mean() 
             
             avg_lm_loss.update(loss.item())
+            
+            # Shift logits and targets for causal language modeling
+            shift_logits = _lm_logits[:, :-1, :].contiguous()
+            shift_targets = _target[:, 1:].contiguous()
+            shift_mask = _msk[:, 1:].contiguous()
+
+            logits_flat = shift_logits.view(-1, shift_logits.size(-1))
+            targets_flat = shift_targets.view(-1)
+
+            loss_flat = criterion(logits_flat, targets_flat).view_as(shift_targets)
+            masked_loss = loss_flat * shift_mask
+
+            masked_target_tokens = shift_targets[shift_mask.bool()]
+            masked_token_losses = masked_loss[shift_mask.bool()]
+
+            # Track sum and count per token ID
+            for token_id, token_loss in zip(masked_target_tokens.tolist(), masked_token_losses.tolist()):
+                token_loss_sum[token_id] += token_loss
+                token_loss_count[token_id] += 1
 
             if idx % 100 == 0:
                 print('eval samples:', idx, 'loss:', loss.float())
+            # Compute average loss per token
+        avg_token_loss = {
+            token: token_loss_sum[token] / token_loss_count[token]
+            for token in token_loss_sum
+        }
+        
+                # Sort by highest/lowest average loss
+        sorted_tokens = sorted(avg_token_loss.items(), key=lambda x: x[1], reverse=True)
+
+        print("\n🔺 Top 10 tokens with highest average loss:")
+        for token_id, loss_val in sorted_tokens[:10]:
+            decoded = enc.decode([token_id]).replace("\n", "\\n")
+            print(f"Token ID {token_id:<6} | Avg Loss: {loss_val:.4f} | Token: '{decoded}'")
+
+        print("\n🟢 Bottom 10 tokens with lowest average loss:")
+        for token_id, loss_val in sorted_tokens[-10:]:
+            decoded = enc.decode([token_id]).replace("\n", "\\n")
+            print(f"Token ID {token_id:<6} | Avg Loss: {loss_val:.4f} | Token: '{decoded}'")
 
         total_time = time.time() - start_time
         print('average loss', avg_lm_loss.avg)
@@ -269,7 +316,7 @@ def train_validate(
                 print('-' * 100)
 
             model.train()
-            distributed_sync(args)
+            #distributed_sync(args)
 
         if train_step == args.max_step:
             break
@@ -291,7 +338,6 @@ def reverse_zero_pad(x, W, enable_lora, out_features):
     result = x.reshape(-1, out_features)[:, lora_ind]
     return result.view((*x.shape[:-1], out_features // len(enable_lora) * sum(enable_lora)))
 
-
 @register_grad_sampler(MergedLinear)
 def compute_transformers_MergedLinear_grad_sample(
     layer: MergedLinear, A: torch.Tensor, B: torch.Tensor
@@ -302,51 +348,68 @@ def compute_transformers_MergedLinear_grad_sample(
         B = torch.stack(B, dim=0)
 
     if A.ndim > 3:
-        A = A.view(A.shape[0], -1, A.shape[-1])  # [batch, seq_len, in_features]
+        A = A.view(A.shape[0], -1, A.shape[-1])  # [N, L, C_in]
     if B.ndim > 3:
-        B = B.view(B.shape[0], -1, B.shape[-1])
+        B = B.view(B.shape[0], -1, B.shape[-1])  # [N, L, C_out]
 
-    delta1 = reverse_zero_pad(B, layer.weight, layer.enable_lora, layer.out_features) * layer.scaling
-    after_A = F.linear(layer.lora_dropout(A), layer.lora_A)
+    delta1 = reverse_zero_pad(B, layer.weight, layer.enable_lora, layer.out_features) * layer.scaling  # [N, L, C_out]
+    A_dropped = layer.lora_dropout(A)
+    after_A = F.linear(A_dropped, layer.lora_A)  # [N, L, r]
+
     if after_A.ndim == 4:
-        after_A = after_A.view(after_A.shape[0], -1, after_A.shape[-2], after_A.shape[-1])
-        after_A = after_A.squeeze(2)
+        after_A = after_A.view(after_A.shape[0], -1, after_A.shape[-2], after_A.shape[-1]).squeeze(2)
 
-    t_after_A = after_A.transpose(-2, -1)
-    in_channel = t_after_A.shape[1]
+    N, L, _ = A.shape
+    r_dim = after_A.shape[-1]
     out_channel = delta1.shape[-1]
+    in_channel = A.shape[-1]
     lora_b_channel = layer.lora_B.shape[0]
-    
-    # Compute grad samples for lora_B
-    gs1 = torch.einsum("nik,nkj->nij", t_after_A[:, :in_channel//2, :], delta1[:, :, :out_channel//2])
-    gs2 = torch.einsum("nik,nkj->nij", t_after_A[:, in_channel//2:, :], delta1[:, :, out_channel//2:])
-    grad_lora_B = torch.cat((gs1, gs2), -1).transpose(-2, -1).contiguous()
 
-    # Compute grad samples for lora_A
-    gs3 = torch.einsum("nik,kj->nij", delta1[:, :, :out_channel//2], layer.lora_B[:lora_b_channel//2, :])
-    gs4 = torch.einsum("nik,kj->nij", delta1[:, :, out_channel//2:], layer.lora_B[lora_b_channel//2:, :])
-    after_A_deriv = torch.cat((gs3, gs4), -1)
-    grad_lora_A = torch.einsum("nki,nkj->nij", after_A_deriv, layer.lora_dropout(A)).contiguous()
+    # Align sequence length
+    seq_len = min(A_dropped.shape[1], delta1.shape[1], after_A.shape[1])
+    A_dropped = A_dropped[:, :seq_len, :]
+    delta1 = delta1[:, :seq_len, :]
+    after_A = after_A[:, :seq_len, :]
 
-    # Return the dictionary mapping each parameter to its per-sample gradient
+    # Grad for lora_B
+    t_after_A = after_A.transpose(1, 2).contiguous()  # [N, r, L]
+    delta1_t = delta1.transpose(1, 2).contiguous()    # [N, C_out, L]
+
+    gs1 = torch.einsum("nrl,ncl->nrc", t_after_A, delta1_t[:, :out_channel // 2, :])
+    gs2 = torch.einsum("nrl,ncl->nrc", t_after_A, delta1_t[:, out_channel // 2:, :])
+    grad_lora_B = torch.cat((gs1, gs2), dim=2).transpose(1, 2).contiguous()  # [N, C_out, r]
+
+    if grad_lora_B.shape[1:] != layer.lora_B.shape:
+        grad_lora_B = grad_lora_B.reshape(N, -1)
+        grad_lora_B = grad_lora_B[:, :layer.lora_B.numel()].reshape(N, *layer.lora_B.shape)
+
+    # Grad for lora_A
+    gs3 = torch.einsum("nlc,cr->nlr", delta1[:, :, :out_channel // 2], layer.lora_B[:lora_b_channel // 2, :])
+    gs4 = torch.einsum("nlc,cr->nlr", delta1[:, :, out_channel // 2:], layer.lora_B[lora_b_channel // 2:, :])
+    after_A_deriv = torch.cat((gs3, gs4), dim=-1)  # [N, L, r]
+
+    grad_lora_A = torch.einsum("nlr,nlc->nrc", after_A_deriv, A_dropped).contiguous()  # [N, r, C_in]
+
+    if grad_lora_A.shape[1:] != layer.lora_A.shape:
+        grad_lora_A = grad_lora_A.reshape(N, -1)
+        grad_lora_A = grad_lora_A[:, :layer.lora_A.numel()].reshape(N, *layer.lora_A.shape)
+
     return {
         layer.lora_B: grad_lora_B,
         layer.lora_A: grad_lora_A,
     }
 
-
-
-
+    
 if __name__ == '__main__':
     args = parser.parse_args()
     # parse_gpu(args)
     print_args(args)
 
-    if args.fp16:
-        try:
-            from apex import amp
-        except Exception as e:
-            warnings.warn('Could not import amp, apex may not be installed')
+    # if args.fp16:
+    #     try:
+    #         from apex import amp
+    #     except Exception as e:
+    #         warnings.warn('Could not import amp, apex may not be installed')
 
     torch.manual_seed(args.random_seed)
     random.seed(args.random_seed)
@@ -422,8 +485,8 @@ if __name__ == '__main__':
         print('set max_step:', args.max_step)
 
     # scheduler = create_optimizer_scheduler(optimizer, args)
-    if args.fp16:
-        lm_net, optimizer = amp.initialize(lm_net, optimizer, opt_level="O1")
+    # if args.fp16:
+    #     lm_net, optimizer = amp.initialize(lm_net, optimizer, opt_level="O1")
 
     n_layers = len([(n, p) for n, p in lm_net.named_parameters() if p.requires_grad])
     # max_grad_norm = [args.max_grad_norm / np.sqrt(n_layers)] * n_layers
